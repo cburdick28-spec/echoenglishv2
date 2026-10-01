@@ -1,20 +1,37 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createClient } from "@supabase/supabase-js";
+import { LayoutDashboard, LogOut, Mail, Mic } from "lucide-react";
+import Dashboard from "./dashboard";
+
+/* -------------------------------------------------------------------------- */
+/* Supabase (browser) client                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The anon key is designed to be public: it can only do what Row Level Security allows,
+ * and our `scores` table has no public policies. All data access goes through the
+ * FastAPI backend, which verifies the user's token first.
+ */
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const supabase = SUPABASE_URL && SUPABASE_ANON_KEY ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
 /* -------------------------------------------------------------------------- */
 /* Constants                                                                  */
 /* -------------------------------------------------------------------------- */
 
-/** Practice sentences, roughly ordered from easy to tricky. */
+/** Corporate practice phrases, roughly ordered from easy to tricky. */
 const PRACTICE_SENTENCES = [
-  "The weather is beautiful today, so we decided to walk to the park.",
-  "She sells seashells by the seashore every summer morning.",
-  "Could you please tell me where the nearest train station is?",
-  "Thirty-three thoughtful thinkers thought through the thorough theory.",
-  "I would rather have a quiet evening at home than go to the party.",
-  "The three brothers thoroughly enjoyed their international vacation.",
-  "Please write down the right answer before the clock strikes eight.",
+  "Thank you for joining the call, let's begin with a quick review of the agenda.",
+  "I would like to schedule a follow-up meeting to discuss the quarterly results.",
+  "Could you please send me the updated proposal before the end of the day?",
+  "Our team is committed to delivering exceptional value to every client.",
+  "Let's schedule a meeting to review the budget and align on our priorities.",
+  "We anticipate a significant increase in revenue throughout the third quarter.",
+  "Please let me know if there are any concerns regarding the project timeline.",
+  "The strategic partnership will strengthen our competitive position in international markets.",
 ];
 
 /** Hard cap on recording length. Keeps uploads under Vercel's ~4.5 MB body limit. */
@@ -73,8 +90,13 @@ function scoreLabel(score) {
   return "Keep practicing";
 }
 
+/** Very light email sanity check; the real validation happens in Supabase. */
+function looksLikeEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
 /* -------------------------------------------------------------------------- */
-/* Components                                                                 */
+/* Small components                                                           */
 /* -------------------------------------------------------------------------- */
 
 /** Circular score gauge drawn with SVG. */
@@ -138,11 +160,129 @@ function HighlightedSentence({ sentence, result }) {
   );
 }
 
+/** Brand header shared by every screen. */
+function Header({ tagline }) {
+  return (
+    <header className="header">
+      <div className="logo">
+        <span className="logo-mark" aria-hidden="true">
+          <Mic size={24} />
+        </span>
+        Echo English
+      </div>
+      {tagline && <p className="tagline">{tagline}</p>}
+    </header>
+  );
+}
+
 /* -------------------------------------------------------------------------- */
-/* Page                                                                       */
+/* Login                                                                      */
 /* -------------------------------------------------------------------------- */
 
-export default function Home() {
+/** Passwordless sign-in: Supabase emails the employee a one-time magic link. */
+function LoginScreen() {
+  const [email, setEmail] = useState("");
+  const [status, setStatus] = useState("idle"); // idle | sending | sent
+  const [error, setError] = useState(null);
+
+  const submit = async (event) => {
+    event.preventDefault();
+    const cleaned = email.trim().toLowerCase();
+    if (!looksLikeEmail(cleaned)) {
+      setError("Please enter a valid work email address.");
+      return;
+    }
+
+    setStatus("sending");
+    setError(null);
+    const { error: authError } = await supabase.auth.signInWithOtp({
+      email: cleaned,
+      options: { emailRedirectTo: window.location.origin },
+    });
+
+    if (authError) {
+      setError(authError.message || "Couldn't send the sign-in link. Please try again.");
+      setStatus("idle");
+      return;
+    }
+    setEmail(cleaned);
+    setStatus("sent");
+  };
+
+  return (
+    <main className="page">
+      <Header tagline="Speech and fluency training for your team." />
+      <section className="card">
+        {status === "sent" ? (
+          <div className="login-sent" role="status">
+            <div className="login-icon" aria-hidden="true">
+              <Mail size={28} />
+            </div>
+            <h2 style={{ margin: "0 0 8px" }}>Check your inbox</h2>
+            <p className="muted" style={{ margin: "0 0 20px" }}>
+              We sent a sign-in link to <strong style={{ color: "var(--text)" }}>{email}</strong>. Open it on this device to
+              continue.
+            </p>
+            <button className="link-button" onClick={() => setStatus("idle")}>
+              Use a different email
+            </button>
+          </div>
+        ) : (
+          <form onSubmit={submit} noValidate>
+            <h2 style={{ margin: "0 0 4px" }}>Sign in</h2>
+            <p className="muted" style={{ margin: "0 0 20px" }}>
+              Enter your work email and we'll send you a secure sign-in link. No password needed.
+            </p>
+            <label className="field-label" htmlFor="email">
+              Work email
+            </label>
+            <input
+              id="email"
+              type="email"
+              className="text-input"
+              placeholder="you@company.com"
+              autoComplete="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              disabled={status === "sending"}
+              required
+            />
+            {error && (
+              <div className="error" role="alert" style={{ marginTop: 14, marginBottom: 0 }}>
+                {error}
+              </div>
+            )}
+            <button className="primary-btn" style={{ marginTop: 16 }} disabled={status === "sending"}>
+              {status === "sending" ? "Sending…" : "Email me a sign-in link"}
+            </button>
+          </form>
+        )}
+      </section>
+    </main>
+  );
+}
+
+/** Shown when the NEXT_PUBLIC_SUPABASE_* variables are missing at build time. */
+function ConfigMissing() {
+  return (
+    <main className="page">
+      <Header />
+      <section className="card" role="alert">
+        <h2 style={{ marginTop: 0 }}>Setup required</h2>
+        <p className="muted">
+          Add <code>NEXT_PUBLIC_SUPABASE_URL</code> and <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code> to your environment
+          variables, then redeploy. See the README for the full setup guide.
+        </p>
+      </section>
+    </main>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Practice view (employee)                                                   */
+/* -------------------------------------------------------------------------- */
+
+function PracticeView({ email, getAccessToken, onSessionExpired }) {
   const [sentenceIndex, setSentenceIndex] = useState(0);
   const [status, setStatus] = useState("idle"); // idle | recording | analyzing | done
   const [seconds, setSeconds] = useState(0);
@@ -182,7 +322,7 @@ export default function Home() {
     };
   }, [audioUrl]);
 
-  /** Uploads the recording to the FastAPI backend and stores the analysis. */
+  /** Uploads the recording (with the user's access token) and stores the analysis. */
   const analyze = useCallback(
     async (blob) => {
       setStatus("analyzing");
@@ -192,18 +332,31 @@ export default function Home() {
       abortRef.current = controller;
 
       try {
+        const token = await getAccessToken();
+        if (!token) {
+          onSessionExpired();
+          return;
+        }
+
         const extension = blob.type.includes("mp4") ? "mp4" : blob.type.includes("ogg") ? "ogg" : "webm";
         const formData = new FormData();
         formData.append("audio", blob, `recording.${extension}`);
         formData.append("expected_text", sentence);
+        // The backend ignores this for identity and verifies it against the token.
+        formData.append("user_email", email);
 
         const response = await fetch("/api/analyze", {
           method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
           body: formData,
           signal: controller.signal,
         });
 
         const data = await response.json().catch(() => null);
+        if (response.status === 401) {
+          onSessionExpired();
+          return;
+        }
         if (!response.ok) {
           throw new Error(data?.detail || `Request failed (${response.status}).`);
         }
@@ -216,7 +369,7 @@ export default function Home() {
         setStatus("idle");
       }
     },
-    [sentence]
+    [sentence, email, getAccessToken, onSessionExpired]
   );
 
   /** Requests the mic and begins recording. */
@@ -232,7 +385,7 @@ export default function Home() {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        // Ask the browser to clean up the signal; helps a lot in noisy rooms.
+        // Ask the browser to clean up the signal; helps a lot in noisy offices.
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
       streamRef.current = stream;
@@ -306,15 +459,7 @@ export default function Home() {
   }[status];
 
   return (
-    <main className="page">
-      <header className="header">
-        <div className="logo">
-          <span className="logo-mark" aria-hidden="true">🎙️</span>
-          Echo English
-        </div>
-        <p className="tagline">AI feedback on your pronunciation, in seconds.</p>
-      </header>
-
+    <>
       {/* Prompt */}
       <section className="card" aria-labelledby="prompt-label">
         <p className="card-label" id="prompt-label">
@@ -365,10 +510,15 @@ export default function Home() {
         )}
       </section>
 
-      {result?.low_confidence && status === "done" && (
-        <div className="error" role="status" style={{ background: "rgba(245,158,11,0.12)", borderColor: "rgba(245,158,11,0.4)", color: "#fde68a" }}>
-          Background noise may have affected this result. For a more accurate score, try again somewhere quieter or
-          hold the microphone closer.
+      {result && status === "done" && result.low_confidence && (
+        <div className="error warn-banner" role="status">
+          Background noise may have affected this result, so this attempt was <strong>not</strong> added to your team's
+          records. Try again somewhere quieter or hold the microphone closer.
+        </div>
+      )}
+      {result && status === "done" && !result.low_confidence && !result.saved && result.score > 0 && (
+        <div className="error warn-banner" role="status">
+          Your feedback is ready, but we couldn't save this attempt to your team's records.
         </div>
       )}
 
@@ -437,8 +587,121 @@ export default function Home() {
           </button>
         </section>
       )}
+    </>
+  );
+}
 
-      <p className="footer">Built with Next.js, FastAPI &amp; Whisper</p>
+/* -------------------------------------------------------------------------- */
+/* Page                                                                       */
+/* -------------------------------------------------------------------------- */
+
+export default function Home() {
+  const [session, setSession] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [isManager, setIsManager] = useState(false);
+  const [tab, setTab] = useState("practice"); // practice | dashboard
+
+  /** Restore any saved session, then keep in sync with sign-in / sign-out / token refresh. */
+  useEffect(() => {
+    if (!supabase) {
+      setAuthReady(true);
+      return undefined;
+    }
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setAuthReady(true);
+    });
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, newSession) => setSession(newSession));
+    return () => subscription.unsubscribe();
+  }, []);
+
+  /** Always read the freshest token (supabase-js refreshes it automatically). */
+  const getAccessToken = useCallback(async () => {
+    const { data } = await supabase.auth.getSession();
+    return data.session?.access_token ?? null;
+  }, []);
+
+  const signOut = useCallback(async () => {
+    await supabase.auth.signOut();
+    setIsManager(false);
+    setTab("practice");
+  }, []);
+
+  /** Ask the backend whether this verified user is a manager (controls the Dashboard tab). */
+  const userId = session?.user?.id;
+  useEffect(() => {
+    if (!userId) {
+      setIsManager(false);
+      return undefined;
+    }
+    const controller = new AbortController();
+    (async () => {
+      try {
+        const token = await getAccessToken();
+        if (!token) return;
+        const response = await fetch("/api/me", {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: controller.signal,
+        });
+        const body = await response.json().catch(() => null);
+        setIsManager(Boolean(response.ok && body?.is_manager));
+      } catch {
+        setIsManager(false); // fail closed: hide the dashboard if we can't confirm
+      }
+    })();
+    return () => controller.abort();
+  }, [userId, getAccessToken]);
+
+  if (!supabase) return <ConfigMissing />;
+
+  if (!authReady) {
+    return (
+      <main className="page">
+        <Header />
+        <div className="loading" role="status">
+          <div className="spinner" aria-hidden="true" />
+        </div>
+      </main>
+    );
+  }
+
+  if (!session) return <LoginScreen />;
+
+  const email = session.user.email;
+
+  return (
+    <main className={`page ${tab === "dashboard" ? "page-wide" : ""}`}>
+      <Header tagline="AI feedback on your pronunciation, in seconds." />
+
+      <div className="userbar">
+        <span className="userbar-email" title={email}>
+          {email}
+        </span>
+        <button className="ghost-btn" onClick={signOut}>
+          <LogOut size={16} /> Sign out
+        </button>
+      </div>
+
+      {isManager && (
+        <nav className="tabs" aria-label="Views">
+          <button className={`tab ${tab === "practice" ? "active" : ""}`} onClick={() => setTab("practice")}>
+            <Mic size={16} /> Practice
+          </button>
+          <button className={`tab ${tab === "dashboard" ? "active" : ""}`} onClick={() => setTab("dashboard")}>
+            <LayoutDashboard size={16} /> Team dashboard
+          </button>
+        </nav>
+      )}
+
+      {tab === "dashboard" && isManager ? (
+        <Dashboard getAccessToken={getAccessToken} />
+      ) : (
+        <PracticeView email={email} getAccessToken={getAccessToken} onSessionExpired={signOut} />
+      )}
+
+      <p className="footer">Built with Next.js, FastAPI, Supabase &amp; Whisper</p>
     </main>
   );
 }
