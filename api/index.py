@@ -24,6 +24,7 @@ from openai import (
     APIConnectionError,
     APIStatusError,
     AsyncOpenAI,
+    NotFoundError,
     RateLimitError,
 )
 from pydantic import BaseModel, Field, ValidationError
@@ -42,6 +43,8 @@ logging.basicConfig(level=logging.INFO)
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 OPENAI_MODELS = ("whisper-1", "gpt-4o-mini")
 GROQ_MODELS = ("whisper-large-v3-turbo", "llama-3.3-70b-versatile")
+# Tried in order if a chat model is unavailable to the account (404 model_not_found).
+GROQ_FALLBACK_MODELS = ("llama-3.1-8b-instant", "openai/gpt-oss-20b")
 
 if os.environ.get("GROQ_API_KEY"):
     TRANSCRIPTION_MODEL, EVALUATION_MODEL = GROQ_MODELS
@@ -198,20 +201,32 @@ async def evaluate_pronunciation(
     client: AsyncOpenAI, expected_text: str, transcript: str
 ) -> AnalysisResult:
     """Ask GPT-4o-mini to compare the transcript with the expected text."""
-    completion = await client.chat.completions.create(
-        model=EVALUATION_MODEL,
-        temperature=0.2,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": EVALUATION_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"expected_text": expected_text, "transcript": transcript}
-                ),
-            },
-        ],
-    )
+    candidates = [EVALUATION_MODEL]
+    if os.environ.get("GROQ_API_KEY"):
+        candidates += [m for m in GROQ_FALLBACK_MODELS if m != EVALUATION_MODEL]
+
+    completion = None
+    for index, model in enumerate(candidates):
+        try:
+            completion = await client.chat.completions.create(
+                model=model,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": EVALUATION_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {"expected_text": expected_text, "transcript": transcript}
+                        ),
+                    },
+                ],
+            )
+            break
+        except NotFoundError:
+            logger.warning("Model %s unavailable; trying next fallback", model)
+            if index == len(candidates) - 1:
+                raise
     raw = completion.choices[0].message.content or "{}"
     return AnalysisResult.model_validate_json(raw)
 
