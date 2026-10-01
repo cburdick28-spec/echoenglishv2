@@ -231,7 +231,10 @@ export default function Home() {
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        // Ask the browser to clean up the signal; helps a lot in noisy rooms.
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
       streamRef.current = stream;
 
       const mimeType = pickSupportedMimeType();
@@ -296,7 +299,7 @@ export default function Home() {
   }, [reset]);
 
   const statusText = {
-    idle: "Tap the microphone and read the sentence aloud",
+    idle: "Tap the microphone and read the sentence aloud (quiet spot works best)",
     recording: "Recording… tap again when you're done",
     analyzing: "",
     done: "Here's how you did",
@@ -361,6 +364,13 @@ export default function Home() {
           </div>
         )}
       </section>
+
+      {result?.low_confidence && status === "done" && (
+        <div className="error" role="status" style={{ background: "rgba(245,158,11,0.12)", borderColor: "rgba(245,158,11,0.4)", color: "#fde68a" }}>
+          Background noise may have affected this result. For a more accurate score, try again somewhere quieter or
+          hold the microphone closer.
+        </div>
+      )}
 
       {/* Results */}
       {result && status === "done" && (

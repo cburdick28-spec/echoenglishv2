@@ -16,7 +16,7 @@ Environment variables:
 import json
 import logging
 import os
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,6 +56,11 @@ else:
 MAX_AUDIO_BYTES = 4 * 1024 * 1024
 MAX_EXPECTED_TEXT_CHARS = 500
 
+# Whisper reports its own confidence per segment. These thresholds flag recordings
+# dominated by background noise so we warn the learner instead of grading garbage.
+NO_SPEECH_PROB_THRESHOLD = 0.6   # segment is probably not speech
+LOW_LOGPROB_THRESHOLD = -1.0     # segment transcription is low confidence
+
 # Maps the browser's MediaRecorder MIME types to a file extension Whisper accepts.
 # Whisper decides the codec from the filename extension, so this must be right.
 MIME_TO_EXTENSION: dict[str, str] = {
@@ -77,6 +82,10 @@ You are a friendly, expert English pronunciation coach for non-native speakers.
 You will receive JSON with two fields:
   - "expected_text": the sentence the learner was asked to read aloud.
   - "transcript": what a speech-recognition system heard the learner say.
+  - "transcription_confidence": "normal" or "low". If "low", the recording was noisy, so
+    odd transcript words may be noise artifacts rather than real mistakes: be lenient,
+    only flag words you are fairly sure were mispronounced, and mention in "feedback"
+    that background noise may have affected the result.
 
 Compare them word by word and respond with ONLY a JSON object using this schema:
 {
@@ -124,6 +133,7 @@ class AnalyzeResponse(AnalysisResult):
     """Evaluation plus the raw transcript, as sent to the frontend."""
 
     transcript: str
+    low_confidence: bool = False  # True when background noise likely hurt the transcription
 
 
 # --------------------------------------------------------------------------- #
@@ -184,21 +194,45 @@ def pick_extension(content_type: Optional[str], filename: Optional[str]) -> str:
     return "webm"
 
 
-async def transcribe_audio(client: AsyncOpenAI, audio: bytes, extension: str) -> str:
-    """Send audio bytes to Whisper and return the transcript text."""
+class Transcription(NamedTuple):
+    """Whisper output plus a rough measure of how trustworthy it is."""
+
+    text: str
+    no_speech: bool        # nothing but noise / silence was detected
+    low_confidence: bool   # speech detected, but Whisper was unsure (noisy audio)
+
+
+def assess_confidence(segments: list) -> tuple[bool, bool]:
+    """Derive (no_speech, low_confidence) flags from Whisper's per-segment stats."""
+    if not segments:
+        return False, False
+    no_speech_probs = [getattr(seg, "no_speech_prob", 0.0) or 0.0 for seg in segments]
+    logprobs = [getattr(seg, "avg_logprob", 0.0) or 0.0 for seg in segments]
+    no_speech = all(
+        p > NO_SPEECH_PROB_THRESHOLD and lp < LOW_LOGPROB_THRESHOLD
+        for p, lp in zip(no_speech_probs, logprobs)
+    )
+    mean_logprob = sum(logprobs) / len(logprobs)
+    return no_speech, mean_logprob < LOW_LOGPROB_THRESHOLD
+
+
+async def transcribe_audio(client: AsyncOpenAI, audio: bytes, extension: str) -> Transcription:
+    """Send audio bytes to Whisper and return the transcript with confidence flags."""
     response = await client.audio.transcriptions.create(
         model=TRANSCRIPTION_MODEL,
         file=(f"recording.{extension}", audio),
         language="en",
         temperature=0,
+        response_format="verbose_json",  # includes per-segment confidence stats
         # Deliberately no `prompt=expected_text`: priming Whisper with the target
         # sentence would bias it toward "correcting" the learner's mistakes.
     )
-    return response.text.strip()
+    no_speech, low_confidence = assess_confidence(getattr(response, "segments", None) or [])
+    return Transcription(response.text.strip(), no_speech, low_confidence)
 
 
 async def evaluate_pronunciation(
-    client: AsyncOpenAI, expected_text: str, transcript: str
+    client: AsyncOpenAI, expected_text: str, transcript: str, low_confidence: bool = False
 ) -> AnalysisResult:
     """Ask GPT-4o-mini to compare the transcript with the expected text."""
     candidates = [EVALUATION_MODEL]
@@ -217,7 +251,11 @@ async def evaluate_pronunciation(
                     {
                         "role": "user",
                         "content": json.dumps(
-                            {"expected_text": expected_text, "transcript": transcript}
+                            {
+                                "expected_text": expected_text,
+                                "transcript": transcript,
+                                "transcription_confidence": "low" if low_confidence else "normal",
+                            }
                         ),
                     },
                 ],
@@ -270,24 +308,31 @@ async def analyze(
     extension = pick_extension(audio.content_type, audio.filename)
 
     try:
-        transcript = await transcribe_audio(client, audio_bytes, extension)
+        transcription = await transcribe_audio(client, audio_bytes, extension)
 
         # Nothing intelligible was heard: skip the second model call.
-        if not transcript:
+        if not transcription.text or transcription.no_speech:
             return AnalyzeResponse(
                 score=0,
                 missed_words=expected_text.split(),
                 mispronounced_words=[],
                 feedback=(
-                    "We couldn't hear any speech in that recording. "
-                    "Check your microphone and try again."
+                    "We couldn't make out any clear speech in that recording. "
+                    "It may be too quiet or too noisy. Please try again."
                 ),
-                tip="Hold the microphone close and speak clearly at a steady pace.",
-                transcript="",
+                tip="Move somewhere quieter, hold the microphone close and speak clearly.",
+                transcript=transcription.text,
+                low_confidence=True,
             )
 
-        result = await evaluate_pronunciation(client, expected_text, transcript)
-        return AnalyzeResponse(**result.model_dump(), transcript=transcript)
+        result = await evaluate_pronunciation(
+            client, expected_text, transcription.text, transcription.low_confidence
+        )
+        return AnalyzeResponse(
+            **result.model_dump(),
+            transcript=transcription.text,
+            low_confidence=transcription.low_confidence,
+        )
 
     except HTTPException:
         raise
