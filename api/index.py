@@ -287,15 +287,20 @@ async def analyze(
             status_code=502, detail="Could not reach the AI service. Please try again."
         )
     except APIStatusError as exc:
-        logger.exception("OpenAI returned an error status")
+        logger.exception("AI provider returned an error status")
+        # Surface the provider's own message (never contains our key) so
+        # misconfiguration, e.g. a bad key or retired model, is easy to diagnose.
+        upstream = f"{exc.status_code}: {getattr(exc, 'message', '')}".strip()[:300]
         # 400 from Whisper usually means an unsupported / corrupt audio file.
-        status = 400 if exc.status_code == 400 else 502
-        detail = (
-            "That audio format couldn't be processed. Please try recording again."
-            if status == 400
-            else "The AI service returned an error. Please try again."
+        if exc.status_code == 400:
+            raise HTTPException(
+                status_code=400,
+                detail=f"That audio couldn't be processed ({upstream}). Please try recording again.",
+            )
+        raise HTTPException(
+            status_code=502,
+            detail=f"The AI service returned an error ({upstream}).",
         )
-        raise HTTPException(status_code=status, detail=detail)
     except (ValidationError, json.JSONDecodeError):
         logger.exception("Model returned malformed JSON")
         raise HTTPException(
