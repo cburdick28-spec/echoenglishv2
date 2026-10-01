@@ -8,7 +8,9 @@ Pipeline for POST /api/analyze:
     4. Validate the model output with Pydantic and return it to the frontend.
 
 Environment variables:
-    OPENAI_API_KEY  (required) - set in the Vercel project settings, or in a local ``.env``.
+    GROQ_API_KEY    (free)     - preferred if set; uses Groq's OpenAI-compatible API.
+    OPENAI_API_KEY  (paid)     - fallback; uses OpenAI directly.
+    Set one in the Vercel project settings, or in a local ``.env``.
 """
 
 import json
@@ -33,8 +35,18 @@ logging.basicConfig(level=logging.INFO)
 # Configuration
 # --------------------------------------------------------------------------- #
 
-TRANSCRIPTION_MODEL = "whisper-1"
-EVALUATION_MODEL = "gpt-4o-mini"
+# Two interchangeable providers share the OpenAI SDK / API format:
+#   - OpenAI (default): whisper-1 + gpt-4o-mini           -> needs OPENAI_API_KEY (paid)
+#   - Groq (free tier): whisper-large-v3-turbo + Llama 3.3 -> needs GROQ_API_KEY
+# If GROQ_API_KEY is set it takes priority, so the app can run at no cost.
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+OPENAI_MODELS = ("whisper-1", "gpt-4o-mini")
+GROQ_MODELS = ("whisper-large-v3-turbo", "llama-3.3-70b-versatile")
+
+if os.environ.get("GROQ_API_KEY"):
+    TRANSCRIPTION_MODEL, EVALUATION_MODEL = GROQ_MODELS
+else:
+    TRANSCRIPTION_MODEL, EVALUATION_MODEL = OPENAI_MODELS
 
 # Vercel Serverless Functions reject request bodies larger than ~4.5 MB,
 # so we enforce a slightly lower limit to return a friendly error instead.
@@ -139,13 +151,17 @@ def get_client() -> AsyncOpenAI:
     """Lazily create the OpenAI client so a missing key yields a clean HTTP error."""
     global _client
     if _client is None:
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
+        groq_key = os.environ.get("GROQ_API_KEY")
+        openai_key = os.environ.get("OPENAI_API_KEY")
+        if groq_key:
+            _client = AsyncOpenAI(api_key=groq_key, base_url=GROQ_BASE_URL)
+        elif openai_key:
+            _client = AsyncOpenAI(api_key=openai_key)
+        else:
             raise HTTPException(
                 status_code=500,
-                detail="Server is not configured: OPENAI_API_KEY is missing.",
+                detail="Server is not configured: set GROQ_API_KEY or OPENAI_API_KEY.",
             )
-        _client = AsyncOpenAI(api_key=api_key)
     return _client
 
 

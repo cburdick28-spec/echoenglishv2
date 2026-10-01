@@ -428,7 +428,7 @@ export default function Home() {
         </section>
       )}
 
-      <p className="footer">Built with Next.js, FastAPI, Whisper &amp; GPT-4o mini</p>
+      <p className="footer">Built with Next.js, FastAPI &amp; Whisper</p>
     </main>
   );
 }
