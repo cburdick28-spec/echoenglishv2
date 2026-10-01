@@ -7,6 +7,9 @@ GET  /api/health      Liveness probe.
 GET  /api/me          Who am I? Returns the verified email and whether I am a manager.
 POST /api/analyze     Transcribe + score a recording, then save the result to Supabase.
 GET  /api/dashboard   Manager-only team analytics computed from the ``scores`` table.
+GET  /api/dashboard/export  Manager-only CSV export of recent attempts.
+GET  /api/history     The signed-in user's own progress (stats, streak, trend, attempts).
+DELETE /api/history   Delete the signed-in user's own stored attempts (privacy).
 
 Security model
 --------------
@@ -28,20 +31,25 @@ Environment variables
     ALLOWED_ORIGINS            (optional) Comma-separated CORS origins. Defaults to "*".
 """
 
+import csv
+import io
 import json
 import logging
 import os
-from collections import defaultdict
+import time
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple, Optional
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from openai import (
     APIConnectionError,
     APIStatusError,
     AsyncOpenAI,
+    BadRequestError,
     NotFoundError,
     RateLimitError,
 )
@@ -88,6 +96,19 @@ TREND_DAYS = 14              # days shown in the team trend chart
 RECENT_ATTEMPTS_LIMIT = 50   # rows shown in the "recent attempts" list
 PAGE_SIZE = 1000             # Supabase returns at most 1000 rows per request
 MAX_DASHBOARD_ROWS = 5000    # safety cap so one request stays fast and cheap
+
+HISTORY_TREND_DAYS = 30      # days shown on the employee's own progress chart
+HISTORY_ATTEMPTS_LIMIT = 20  # attempts listed on the employee's progress page
+HISTORY_MAX_ROWS = 500       # newest rows loaded per user for stats
+
+# --- Fluency (pace and pauses) ----------------------------------------------
+PAUSE_THRESHOLD_SECONDS = 0.6   # a silent gap between words at least this long is a "pause"
+SLOW_WPM = 110                  # below this, reading aloud sounds slow
+FAST_WPM = 170                  # above this, reading aloud sounds rushed
+
+# --- Per-user rate limit (protects the free AI quota) -----------------------
+RATE_LIMIT_MAX_REQUESTS = 10
+RATE_LIMIT_WINDOW_SECONDS = 300
 
 # Maps the browser's MediaRecorder MIME types to a file extension Whisper accepts.
 # Whisper decides the codec from the filename extension, so this must be right.
@@ -157,12 +178,24 @@ class AnalysisResult(BaseModel):
     tip: str
 
 
+class FluencyMetrics(BaseModel):
+    """Delivery metrics derived from Whisper's word timestamps (no extra AI call)."""
+
+    words_per_minute: int
+    pause_count: int
+    longest_pause_seconds: float
+    speaking_seconds: float
+    pace_label: str            # "slow" | "natural" | "fast"
+    summary: str               # one friendly sentence for the learner
+
+
 class AnalyzeResponse(AnalysisResult):
     """Evaluation plus the raw transcript, as sent to the frontend."""
 
     transcript: str
     low_confidence: bool = False  # True when background noise likely hurt the transcription
     saved: bool = False           # True when stored in Supabase (noisy attempts are not)
+    fluency: Optional[FluencyMetrics] = None
 
 
 class AuthUser(BaseModel):
@@ -210,6 +243,25 @@ class Attempt(BaseModel):
     created_at: str
 
 
+class HistoryResponse(BaseModel):
+    """A signed-in user's own progress."""
+
+    email: str
+    sessions: int
+    average_score: float
+    best_score: int
+    latest_score: int
+    streak_days: int           # consecutive days (UTC) with at least one attempt
+    trend: list[TrendPoint]
+    attempts: list[Attempt]
+
+
+class DeleteResponse(BaseModel):
+    """Result of a "delete my data" request."""
+
+    deleted: int
+
+
 class DashboardResponse(BaseModel):
     """Everything the manager dashboard needs in one payload."""
 
@@ -242,7 +294,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins or ["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -391,19 +443,38 @@ def parse_timestamp(value: Any) -> Optional[datetime]:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def build_dashboard(
-    rows: list[dict[str, Any]], total: int, now: Optional[datetime] = None
-) -> DashboardResponse:
-    """Turn raw ``scores`` rows (newest first) into the dashboard payload. Pure function."""
-    now = now or datetime.now(timezone.utc)
+def clean_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop malformed rows and attach a parsed ``_ts`` timestamp and lowercase email."""
     clean: list[dict[str, Any]] = []
     for row in rows:
         stamp = parse_timestamp(row.get("created_at"))
         score = row.get("score")
         email = (row.get("user_email") or "").strip().lower()
         if stamp is None or not isinstance(score, int) or not email:
-            continue  # skip malformed rows instead of failing the whole dashboard
+            continue  # skip malformed rows instead of failing the whole page
         clean.append({**row, "user_email": email, "_ts": stamp})
+    return clean
+
+
+def daily_trend(clean: list[dict[str, Any]], now: datetime, days: int) -> list[TrendPoint]:
+    """Average score per calendar day (UTC) over the last ``days`` days."""
+    cutoff = (now - timedelta(days=days)).date()
+    by_day: dict[str, list[int]] = defaultdict(list)
+    for row in clean:
+        if row["_ts"].date() >= cutoff:
+            by_day[row["_ts"].date().isoformat()].append(row["score"])
+    return [
+        TrendPoint(date=day, average_score=round(sum(v) / len(v), 1), sessions=len(v))
+        for day, v in sorted(by_day.items())
+    ]
+
+
+def build_dashboard(
+    rows: list[dict[str, Any]], total: int, now: Optional[datetime] = None
+) -> DashboardResponse:
+    """Turn raw ``scores`` rows (newest first) into the dashboard payload. Pure function."""
+    now = now or datetime.now(timezone.utc)
+    clean = clean_rows(rows)
 
     # Per-employee rollups (rows are newest-first, so the first rows are the "recent" ones).
     by_user: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -429,16 +500,7 @@ def build_dashboard(
     # Coaching candidates first, then lowest recent average.
     employees.sort(key=lambda e: (not e.needs_coaching, e.recent_average, e.email))
 
-    # Daily team trend for the last TREND_DAYS days.
-    cutoff = (now - timedelta(days=TREND_DAYS)).date()
-    by_day: dict[str, list[int]] = defaultdict(list)
-    for row in clean:
-        if row["_ts"].date() >= cutoff:
-            by_day[row["_ts"].date().isoformat()].append(row["score"])
-    trend = [
-        TrendPoint(date=day, average_score=round(sum(v) / len(v), 1), sessions=len(v))
-        for day, v in sorted(by_day.items())
-    ]
+    trend = daily_trend(clean, now, TREND_DAYS)
 
     all_scores = [r["score"] for r in clean]
     return DashboardResponse(
@@ -464,6 +526,109 @@ def build_dashboard(
     )
 
 
+def _fetch_user_rows(email: str) -> tuple[list[dict[str, Any]], int]:
+    """Newest rows for one user plus their exact total. Blocking."""
+    page = (
+        get_supabase()
+        .table(SCORES_TABLE)
+        .select("id,user_email,expected_text,actual_text,score,created_at", count="exact")
+        .eq("user_email", email)
+        .order("created_at", desc=True)
+        .limit(HISTORY_MAX_ROWS)
+        .execute()
+    )
+    rows = page.data or []
+    return rows, max(page.count or 0, len(rows))
+
+
+def _delete_user_rows(email: str) -> int:
+    """Delete every stored attempt for one user. Blocking. Returns the number deleted."""
+    result = get_supabase().table(SCORES_TABLE).delete().eq("user_email", email).execute()
+    return len(result.data or [])
+
+
+def compute_streak(days: set, today) -> int:
+    """Consecutive days with practice, counting back from today (or yesterday)."""
+    cursor = today if today in days else today - timedelta(days=1)
+    streak = 0
+    while cursor in days:
+        streak += 1
+        cursor -= timedelta(days=1)
+    return streak
+
+
+def build_history(
+    rows: list[dict[str, Any]], total: int, email: str, now: Optional[datetime] = None
+) -> HistoryResponse:
+    """Turn one user's rows (newest first) into their progress payload. Pure function."""
+    now = now or datetime.now(timezone.utc)
+    clean = clean_rows(rows)
+    scores = [r["score"] for r in clean]
+    return HistoryResponse(
+        email=email,
+        sessions=total,
+        average_score=round(sum(scores) / len(scores), 1) if scores else 0.0,
+        best_score=max(scores) if scores else 0,
+        latest_score=scores[0] if scores else 0,
+        streak_days=compute_streak({r["_ts"].date() for r in clean}, now.date()),
+        trend=daily_trend(clean, now, HISTORY_TREND_DAYS),
+        attempts=[
+            Attempt(
+                id=str(r.get("id", "")),
+                user_email=r["user_email"],
+                expected_text=r.get("expected_text") or "",
+                actual_text=r.get("actual_text") or "",
+                score=r["score"],
+                created_at=r["_ts"].isoformat(),
+            )
+            for r in clean[:HISTORY_ATTEMPTS_LIMIT]
+        ],
+    )
+
+
+def csv_safe(value: Any) -> str:
+    """Neutralise spreadsheet formula injection: cells starting with = + - @ are prefixed."""
+    text = "" if value is None else str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
+
+def build_csv(rows: list[dict[str, Any]]) -> str:
+    """Render score rows as CSV text (newest first)."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["created_at", "user_email", "score", "expected_text", "actual_text"])
+    for row in rows:
+        writer.writerow(
+            [
+                csv_safe(row.get("created_at")),
+                csv_safe(row.get("user_email")),
+                row.get("score"),
+                csv_safe(row.get("expected_text")),
+                csv_safe(row.get("actual_text")),
+            ]
+        )
+    return buffer.getvalue()
+
+
+# Best-effort sliding-window limiter. State is per serverless instance, so it curbs
+# runaway usage of the free AI quota but is not a hard global guarantee.
+_recent_requests: dict[str, deque] = defaultdict(deque)
+
+
+def check_rate_limit(email: str) -> None:
+    """Raise 429 if this user has made too many analyses recently."""
+    now = time.monotonic()
+    window = _recent_requests[email]
+    while window and now - window[0] > RATE_LIMIT_WINDOW_SECONDS:
+        window.popleft()
+    if len(window) >= RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(
+            status_code=429,
+            detail="You're practicing fast! Please wait a few minutes before the next attempt.",
+        )
+    window.append(now)
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -486,6 +651,7 @@ class Transcription(NamedTuple):
     text: str
     no_speech: bool        # nothing but noise / silence was detected
     low_confidence: bool   # speech detected, but Whisper was unsure (noisy audio)
+    fluency: Optional[FluencyMetrics] = None
 
 
 def assess_confidence(segments: list) -> tuple[bool, bool]:
@@ -502,9 +668,52 @@ def assess_confidence(segments: list) -> tuple[bool, bool]:
     return no_speech, mean_logprob < LOW_LOGPROB_THRESHOLD
 
 
+def compute_fluency(words: list, segments: list, transcript: str) -> Optional[FluencyMetrics]:
+    """Estimate speaking pace and pauses from Whisper timestamps.
+
+    Uses word-level timings when available (accurate pauses) and falls back to segment
+    timings otherwise. Returns None when there is too little speech to judge.
+    """
+    timed = [(float(w.start), float(w.end)) for w in words if hasattr(w, "start") and hasattr(w, "end")]
+    word_count = len(timed)
+    if word_count < 3:
+        timed = [(float(g.start), float(g.end)) for g in segments if hasattr(g, "start") and hasattr(g, "end")]
+        word_count = len(transcript.split())
+    if word_count < 3 or not timed:
+        return None
+
+    speaking_seconds = timed[-1][1] - timed[0][0]
+    if speaking_seconds <= 0.5:
+        return None
+
+    gaps = [nxt[0] - cur[1] for cur, nxt in zip(timed, timed[1:])]
+    pauses = [g for g in gaps if g >= PAUSE_THRESHOLD_SECONDS]
+    wpm = round(word_count / (speaking_seconds / 60))
+
+    if wpm < SLOW_WPM:
+        label, pace_note = "slow", "a little slow; try to keep a steady, confident flow"
+    elif wpm > FAST_WPM:
+        label, pace_note = "fast", "quite fast; slow down slightly so every word is clear"
+    else:
+        label, pace_note = "natural", "a natural pace"
+
+    pause_note = (
+        "no long pauses" if not pauses
+        else f"{len(pauses)} noticeable pause{'s' if len(pauses) != 1 else ''}"
+    )
+    return FluencyMetrics(
+        words_per_minute=wpm,
+        pause_count=len(pauses),
+        longest_pause_seconds=round(max(pauses), 1) if pauses else 0.0,
+        speaking_seconds=round(speaking_seconds, 1),
+        pace_label=label,
+        summary=f"You spoke at about {wpm} words per minute ({pace_note}) with {pause_note}.",
+    )
+
+
 async def transcribe_audio(client: AsyncOpenAI, audio: bytes, extension: str) -> Transcription:
-    """Send audio bytes to Whisper and return the transcript with confidence flags."""
-    response = await client.audio.transcriptions.create(
+    """Send audio bytes to Whisper and return the transcript with confidence + fluency."""
+    kwargs: dict[str, Any] = dict(
         model=TRANSCRIPTION_MODEL,
         file=(f"recording.{extension}", audio),
         language="en",
@@ -513,8 +722,23 @@ async def transcribe_audio(client: AsyncOpenAI, audio: bytes, extension: str) ->
         # Deliberately no `prompt=expected_text`: priming Whisper with the target
         # sentence would bias it toward "correcting" the learner's mistakes.
     )
-    no_speech, low_confidence = assess_confidence(getattr(response, "segments", None) or [])
-    return Transcription(response.text.strip(), no_speech, low_confidence)
+    try:
+        # Word timestamps give accurate pause detection.
+        response = await client.audio.transcriptions.create(
+            **kwargs, timestamp_granularities=["word", "segment"]
+        )
+    except BadRequestError as exc:
+        # Some providers/models reject word timestamps; retry without them. A genuinely
+        # bad audio file fails again below and is reported normally.
+        logger.warning("Word timestamps unavailable (%s); retrying without them", exc.message)
+        response = await client.audio.transcriptions.create(**kwargs)
+
+    segments = getattr(response, "segments", None) or []
+    words = getattr(response, "words", None) or []
+    text = response.text.strip()
+    no_speech, low_confidence = assess_confidence(segments)
+    fluency = None if no_speech or not text else compute_fluency(words, segments, text)
+    return Transcription(text, no_speech, low_confidence, fluency)
 
 
 async def evaluate_pronunciation(
@@ -588,6 +812,49 @@ async def dashboard(_manager: AuthUser = Depends(require_manager)) -> DashboardR
     return build_dashboard(rows, total)
 
 
+@app.get("/api/dashboard/export")
+async def export_dashboard(_manager: AuthUser = Depends(require_manager)) -> Response:
+    """Manager-only CSV download of the most recent attempts."""
+    try:
+        rows, _total = await run_in_threadpool(_fetch_score_rows)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to export scores from Supabase")
+        raise HTTPException(status_code=502, detail="Couldn't export data. Please try again.")
+    return Response(
+        content=build_csv(rows),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="echo-english-scores.csv"'},
+    )
+
+
+@app.get("/api/history", response_model=HistoryResponse)
+async def history(user: AuthUser = Depends(current_user)) -> HistoryResponse:
+    """The signed-in user's own progress: stats, streak, 30-day trend and recent attempts."""
+    try:
+        rows, total = await run_in_threadpool(_fetch_user_rows, user.email)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to load user history from Supabase")
+        raise HTTPException(status_code=502, detail="Couldn't load your progress. Please try again.")
+    return build_history(rows, total, user.email)
+
+
+@app.delete("/api/history", response_model=DeleteResponse)
+async def delete_history(user: AuthUser = Depends(current_user)) -> DeleteResponse:
+    """Delete the signed-in user's own stored attempts. Only ever touches their own rows."""
+    try:
+        deleted = await run_in_threadpool(_delete_user_rows, user.email)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to delete user history from Supabase")
+        raise HTTPException(status_code=502, detail="Couldn't delete your data. Please try again.")
+    return DeleteResponse(deleted=deleted)
+
+
 @app.post("/api/analyze", response_model=AnalyzeResponse)
 async def analyze(
     audio: UploadFile = File(..., description="Recorded speech (webm, mp4, ogg, wav...)."),
@@ -605,6 +872,8 @@ async def analyze(
         raise HTTPException(
             status_code=403, detail="You can only submit recordings for your own account."
         )
+
+    check_rate_limit(user.email)
 
     expected_text = expected_text.strip()
     if not expected_text:
@@ -659,6 +928,7 @@ async def analyze(
             transcript=transcription.text,
             low_confidence=transcription.low_confidence,
             saved=saved,
+            fluency=transcription.fluency,
         )
 
     except HTTPException:

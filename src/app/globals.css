@@ -689,3 +689,23 @@ code {
     animation-duration: 3s;
   }
 }
+
+/* ---------- Delivery (fluency) mini stats ---------- */
+.mini-stats {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.mini-stat {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: rgba(15, 23, 42, 0.6);
+  border-radius: 12px;
+  padding: 10px 16px;
+  color: var(--muted);
+}
+.mini-stat strong {
+  color: var(--text);
+  font-size: 1.25rem;
+}

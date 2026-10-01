@@ -2,12 +2,28 @@
 
 **AI-powered English pronunciation and fluency training for teams.** Employees sign in, read corporate phrases aloud, and get instant AI feedback with a score out of 100. Managers get a dashboard with team averages, practice volume, trends and a list of who needs extra coaching.
 
+## Screenshots
+
+*Screenshots use sample data.*
+
+| Practice with feedback | My progress |
+| --- | --- |
+| ![Practice results](docs/screenshots/practice-results.png) | ![My progress](docs/screenshots/my-progress.png) |
+
+| Manager dashboard | Sign in |
+| --- | --- |
+| ![Team dashboard](docs/screenshots/team-dashboard.png) | ![Login](docs/screenshots/login.png) |
+
 ## Features
 
 **For employees**
 - Passwordless sign-in with a magic link (Supabase Auth)
 - Corporate practice phrases, in-browser recording (MediaRecorder API) and instant feedback
 - Score ring, missed and mispronounced words highlighted in the sentence, and a practice tip
+- **Fluency metrics:** speaking pace (words per minute) and pause detection from Whisper word timestamps
+- **"Hear it first":** the browser reads the target sentence aloud (Web Speech API)
+- **My progress:** personal average, best score, practice streak, 30-day trend and attempt history
+- **Privacy controls:** one-click deletion of your own saved attempts; audio is never stored by the app
 - Noise-aware scoring: noisy recordings are flagged instead of unfairly penalised
 
 **For managers**
@@ -15,6 +31,7 @@
 - 14-day team trend chart
 - Per-employee table with a **"Needs coaching"** flag (recent average below 70)
 - History of recent attempts (what was expected vs. what was heard)
+- **CSV export** of attempts (with spreadsheet-formula injection protection)
 
 ## Architecture
 
@@ -36,6 +53,9 @@ Browser (Next.js)  ──Bearer token──▶  FastAPI on Vercel  ──▶  Wh
 - Submitting a recording for someone else's email is rejected (`403`).
 - Dashboard access is checked server-side; hiding the tab in the UI is only a convenience.
 - Noisy (low-confidence) attempts are not stored, so background noise can't wrongly flag an employee for coaching.
+- Users can only read or delete **their own** rows; the email always comes from the verified token.
+- A per-user rate limit (10 analyses per 5 minutes) protects the free AI quota. It is best-effort per serverless instance, not a global guarantee.
+- CSV exports prefix cells starting with `=`, `+`, `-` or `@` so they can't run as spreadsheet formulas.
 
 ## Tech stack
 
@@ -54,13 +74,19 @@ echo-english/
 ├── api/
 │   └── index.py          # FastAPI backend: auth, analysis, Supabase reads/writes
 ├── src/app/
-│   ├── page.js           # Login, employee practice UI, tabs
+│   ├── page.js           # Login, practice UI, fluency card, tabs
+│   ├── progress.js       # "My progress" tab and privacy controls
 │   ├── dashboard.js      # Manager dashboard
+│   ├── shared.js         # Shared stat cards, SVG trend chart, formatters
 │   ├── layout.js         # Root layout and metadata
 │   └── globals.css       # Styles
 ├── supabase/
 │   └── schema.sql        # Table + indexes + Row Level Security
+├── tests/                # pytest suite (AI and Supabase are mocked)
+├── .github/workflows/    # CI: backend tests + frontend build
+├── docs/screenshots/     # README images
 ├── requirements.txt
+├── requirements-dev.txt  # + pytest
 ├── package.json
 └── vercel.json           # Routes /api/* to the Python function
 ```
@@ -102,6 +128,15 @@ vercel dev      # runs Next.js and the Python API together
 
 Open http://localhost:3000. Microphone access requires `localhost` or HTTPS.
 
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite mocks the AI provider and Supabase, and covers authentication, spoofing and manager-only access, saving and failure handling, fluency calculations, dashboard and history analytics, CSV safety, deletion and rate limiting. GitHub Actions runs it (plus a production frontend build) on every push.
+
 ## API
 
 All routes except `/api/health` need `Authorization: Bearer <supabase access token>`.
@@ -110,8 +145,11 @@ All routes except `/api/health` need `Authorization: Bearer <supabase access tok
 | --- | --- | --- |
 | `GET /api/health` | public | Liveness probe |
 | `GET /api/me` | signed in | Verified email and `is_manager` flag |
-| `POST /api/analyze` | signed in | Multipart: `audio`, `expected_text`, optional `user_email` (must match the token). Returns score, feedback, tip, transcript, `saved` |
+| `POST /api/analyze` | signed in | Multipart: `audio`, `expected_text`, optional `user_email` (must match the token). Returns score, feedback, tip, transcript, `fluency`, `saved` |
+| `GET /api/history` | signed in | Your own stats, streak, 30-day trend and recent attempts |
+| `DELETE /api/history` | signed in | Delete your own saved attempts |
 | `GET /api/dashboard` | managers | Team metrics, trend, per-employee summaries, recent attempts |
+| `GET /api/dashboard/export` | managers | CSV download of recent attempts |
 
 ## Design notes
 
@@ -124,5 +162,5 @@ All routes except `/api/health` need `Authorization: Bearer <supabase access tok
 ## Possible next steps
 
 - Multiple teams / companies with per-team manager access
-- Per-employee progress page and CSV export
-- Phoneme-level feedback and custom corporate vocabulary
+- Manager-defined custom phrase sets
+- Phoneme-level feedback and a stronger noise-reduction step (e.g. RNNoise in the browser)

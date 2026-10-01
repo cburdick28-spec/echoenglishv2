@@ -2,8 +2,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
-import { LayoutDashboard, LogOut, Mail, Mic } from "lucide-react";
+import { Gauge, LayoutDashboard, LogOut, Mail, Mic, Timer, TrendingUp, Volume2 } from "lucide-react";
 import Dashboard from "./dashboard";
+import MyProgress from "./progress";
 
 /* -------------------------------------------------------------------------- */
 /* Supabase (browser) client                                                  */
@@ -160,6 +161,38 @@ function HighlightedSentence({ sentence, result }) {
   );
 }
 
+/** Pace and pause metrics derived from word timestamps. */
+function FluencyCard({ fluency }) {
+  const paceTone = fluency.pace_label === "natural" ? "var(--good)" : "var(--warn)";
+  return (
+    <>
+      <hr className="divider" />
+      <h3 className="section-title">Delivery</h3>
+      <div className="mini-stats">
+        <div className="mini-stat">
+          <Gauge size={18} aria-hidden="true" />
+          <div>
+            <strong style={{ color: paceTone }}>{fluency.words_per_minute}</strong> words/min
+            <span className="muted" style={{ display: "block", fontSize: "0.8rem" }}>
+              {fluency.pace_label} pace
+            </span>
+          </div>
+        </div>
+        <div className="mini-stat">
+          <Timer size={18} aria-hidden="true" />
+          <div>
+            <strong>{fluency.pause_count}</strong> pause{fluency.pause_count === 1 ? "" : "s"}
+            <span className="muted" style={{ display: "block", fontSize: "0.8rem" }}>
+              {fluency.pause_count > 0 ? `longest ${fluency.longest_pause_seconds}s` : "smooth flow"}
+            </span>
+          </div>
+        </div>
+      </div>
+      <p className="muted" style={{ margin: "12px 0 0" }}>{fluency.summary}</p>
+    </>
+  );
+}
+
 /** Brand header shared by every screen. */
 function Header({ tagline }) {
   return (
@@ -255,6 +288,10 @@ function LoginScreen() {
             <button className="primary-btn" style={{ marginTop: 16 }} disabled={status === "sending"}>
               {status === "sending" ? "Sending…" : "Email me a sign-in link"}
             </button>
+            <p className="muted" style={{ fontSize: "0.8rem", margin: "14px 0 0" }}>
+              We save your email and the text of your practice attempts so you and your managers can track progress. Your
+              audio is sent to our AI provider to be transcribed and is not stored by Echo English.
+            </p>
           </form>
         )}
       </section>
@@ -296,6 +333,8 @@ function PracticeView({ email, getAccessToken, onSessionExpired }) {
   const timerRef = useRef(null);
   const abortRef = useRef(null);
 
+  const [canSpeak, setCanSpeak] = useState(false);
+
   const sentence = PRACTICE_SENTENCES[sentenceIndex];
   const isRecording = status === "recording";
   const isAnalyzing = status === "analyzing";
@@ -307,13 +346,34 @@ function PracticeView({ email, getAccessToken, onSessionExpired }) {
     streamRef.current = null;
   }, []);
 
-  /** Clean up on unmount: release the mic, cancel in-flight requests. */
+  /** Text-to-speech support is only known in the browser (avoids a hydration mismatch). */
+  useEffect(() => {
+    setCanSpeak(typeof window !== "undefined" && "speechSynthesis" in window);
+  }, []);
+
+  /** Stops any speech that is currently playing. */
+  const stopSpeaking = useCallback(() => {
+    if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
+  }, []);
+
+  /** Reads the target sentence aloud so the learner knows what to aim for. */
+  const speakSentence = useCallback(() => {
+    if (!("speechSynthesis" in window)) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(sentence);
+    utterance.lang = "en-US";
+    utterance.rate = 0.9;
+    window.speechSynthesis.speak(utterance);
+  }, [sentence]);
+
+  /** Clean up on unmount: release the mic, stop speech, cancel in-flight requests. */
   useEffect(() => {
     return () => {
       releaseResources();
+      stopSpeaking();
       abortRef.current?.abort();
     };
-  }, [releaseResources]);
+  }, [releaseResources, stopSpeaking]);
 
   /** Revoke the previous object URL whenever a new recording replaces it. */
   useEffect(() => {
@@ -374,6 +434,7 @@ function PracticeView({ email, getAccessToken, onSessionExpired }) {
 
   /** Requests the mic and begins recording. */
   const startRecording = useCallback(async () => {
+    stopSpeaking(); // make sure the example voice isn't picked up by the microphone
     setError(null);
     setResult(null);
     setAudioUrl(null);
@@ -429,7 +490,7 @@ function PracticeView({ email, getAccessToken, onSessionExpired }) {
       setError(describeMicError(err));
       setStatus("idle");
     }
-  }, [analyze, releaseResources]);
+  }, [analyze, releaseResources, stopSpeaking]);
 
   /** Stops recording; the recorder's onstop handler takes over from here. */
   const stopRecording = useCallback(() => {
@@ -447,9 +508,10 @@ function PracticeView({ email, getAccessToken, onSessionExpired }) {
 
   /** Moves to the next practice sentence. */
   const nextSentence = useCallback(() => {
+    stopSpeaking();
     reset();
     setSentenceIndex((i) => (i + 1) % PRACTICE_SENTENCES.length);
-  }, [reset]);
+  }, [reset, stopSpeaking]);
 
   const statusText = {
     idle: "Tap the microphone and read the sentence aloud (quiet spot works best)",
@@ -464,9 +526,16 @@ function PracticeView({ email, getAccessToken, onSessionExpired }) {
       <section className="card" aria-labelledby="prompt-label">
         <p className="card-label" id="prompt-label">
           <span>Read this aloud</span>
-          <button className="link-button" onClick={nextSentence} disabled={isRecording || isAnalyzing}>
-            New sentence ↻
-          </button>
+          <span style={{ display: "inline-flex", gap: 16 }}>
+            {canSpeak && (
+              <button className="link-button" onClick={speakSentence} disabled={isRecording || isAnalyzing}>
+                <Volume2 size={14} style={{ verticalAlign: "-2px" }} aria-hidden="true" /> Hear it first
+              </button>
+            )}
+            <button className="link-button" onClick={nextSentence} disabled={isRecording || isAnalyzing}>
+              New sentence ↻
+            </button>
+          </span>
         </p>
         <HighlightedSentence sentence={sentence} result={result} />
       </section>
@@ -540,6 +609,8 @@ function PracticeView({ email, getAccessToken, onSessionExpired }) {
           <h3 className="section-title">What we heard</h3>
           <p className="transcript">“{result.transcript || "—"}”</p>
 
+          {result.fluency && <FluencyCard fluency={result.fluency} />}
+
           {result.missed_words.length > 0 && (
             <>
               <hr className="divider" />
@@ -599,7 +670,7 @@ export default function Home() {
   const [session, setSession] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const [isManager, setIsManager] = useState(false);
-  const [tab, setTab] = useState("practice"); // practice | dashboard
+  const [tab, setTab] = useState("practice"); // practice | progress | dashboard
 
   /** Restore any saved session, then keep in sync with sign-in / sign-out / token refresh. */
   useEffect(() => {
@@ -672,7 +743,7 @@ export default function Home() {
   const email = session.user.email;
 
   return (
-    <main className={`page ${tab === "dashboard" ? "page-wide" : ""}`}>
+    <main className={`page ${tab !== "practice" ? "page-wide" : ""}`}>
       <Header tagline="AI feedback on your pronunciation, in seconds." />
 
       <div className="userbar">
@@ -684,19 +755,24 @@ export default function Home() {
         </button>
       </div>
 
-      {isManager && (
-        <nav className="tabs" aria-label="Views">
-          <button className={`tab ${tab === "practice" ? "active" : ""}`} onClick={() => setTab("practice")}>
-            <Mic size={16} /> Practice
-          </button>
+      <nav className="tabs" aria-label="Views">
+        <button className={`tab ${tab === "practice" ? "active" : ""}`} onClick={() => setTab("practice")}>
+          <Mic size={16} /> Practice
+        </button>
+        <button className={`tab ${tab === "progress" ? "active" : ""}`} onClick={() => setTab("progress")}>
+          <TrendingUp size={16} /> My progress
+        </button>
+        {isManager && (
           <button className={`tab ${tab === "dashboard" ? "active" : ""}`} onClick={() => setTab("dashboard")}>
             <LayoutDashboard size={16} /> Team dashboard
           </button>
-        </nav>
-      )}
+        )}
+      </nav>
 
       {tab === "dashboard" && isManager ? (
         <Dashboard getAccessToken={getAccessToken} />
+      ) : tab === "progress" ? (
+        <MyProgress getAccessToken={getAccessToken} />
       ) : (
         <PracticeView email={email} getAccessToken={getAccessToken} onSessionExpired={signOut} />
       )}
